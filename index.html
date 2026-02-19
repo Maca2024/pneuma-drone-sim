@@ -1373,14 +1373,13 @@ function processInput(dt) {
   const wantUp = keys['Space'] || (mouse.locked && mouse.lmb);
   const wantDown = keys['ShiftLeft'] || keys['ShiftRight'] || (mouse.locked && mouse.rmb);
 
-  if (wantUp)        d.throttle = Math.min(1, d.throttle + dt * 2.5);
-  else if (wantDown)  d.throttle = Math.max(0, d.throttle - dt * 3.0);
+  if (wantUp)        d.throttle = Math.min(1, d.throttle + dt * 5.0);  // fast ramp: 0→1 in 0.2s
+  else if (wantDown)  d.throttle = Math.max(0, d.throttle - dt * 5.0);
   else {
-    // Auto-hover: smoothly go to hover throttle
-    // Compensate more when tilting so drone doesn't drop
+    // Auto-hover: smoothly hold altitude
     const tiltAmount = Math.abs(pitchInput) + Math.abs(rollInput) * 0.5;
     const hoverThrottle = 0.52 + tiltAmount * 0.15;
-    d.throttle += (hoverThrottle - d.throttle) * dt * 2.0;
+    d.throttle += (hoverThrottle - d.throttle) * dt * 4.0;  // faster convergence
   }
   // Scroll wheel fine adjustment
   if (mouse.scrollThrottle !== 0) {
@@ -1538,7 +1537,7 @@ function updatePhysics(dt) {
   drone.group.rotation.set(d.tiltX + flipAngle, d.yaw, d.tiltZ, 'YXZ');
 
   // Rotor spin (faster when boosting)
-  const rotorSpeed = cfg.rotorSpeed * (0.3 + d.throttle * 0.7) * boostMultiplier;
+  const rotorSpeed = cfg.rotorSpeed * (0.3 + d.throttle * 0.7) * boostMult;
   drone.rotors.forEach((r, i) => {
     r.rotation.z += rotorSpeed * dt * (i % 2 === 0 ? 1 : -1);
   });
@@ -1992,10 +1991,12 @@ function resetDrone() {
   droneState.pos.set(0, 2, 0);
   droneState.vel.set(0, 0, 0);
   droneState.rotation.set(0, 0, 0);
-  droneState.throttle = 0;
+  droneState.throttle = 0.52;  // start at hover throttle (not 0!)
   droneState.tiltX = 0;
   droneState.tiltZ = 0;
   droneState.yaw = 0;
+  droneState._pitchInput = 0;
+  droneState._rollInput = 0;
   droneState.boost = 1;
   droneState.boosting = false;
   state.battery = 100;
