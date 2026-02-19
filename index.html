@@ -552,7 +552,7 @@ const CONFIG = {
   world: { size: 2000, gridSize: 200, maxAlt: 500 },
   drone: {
     mass: 1.5,
-    thrustMax: 22,       // lift only (arcade: vertical)
+    thrustMax: 38,       // lift only (arcade: vertical) — must beat gravity at hover
     gravity: -9.81,
     dragCoeff: 2.5,      // linear drag (not quadratic)
     angularDrag: 3.0,
@@ -1437,8 +1437,11 @@ function updatePhysics(dt) {
 
   // === CORE: Arcade flight model ===
   // 1) Vertical thrust — always points straight up (keeps altitude stable)
-  const liftForce = d.throttle * cfg.thrustMax * 1.1 / cfg.mass;
-  const verticalAcc = liftForce + cfg.gravity; // net vertical
+  // Lift: at hover throttle ~0.52 → must exceed gravity (9.81)
+  // 0.52 * 38 / 1.5 = 13.2 → net +3.4 (gentle rise) ✓
+  // full throttle: 1.0 * 38 / 1.5 = 25.3 → net +15.5 (strong climb) ✓
+  const liftForce = d.throttle * cfg.thrustMax / cfg.mass;
+  const verticalAcc = liftForce + cfg.gravity;
 
   // 2) Forward/backward force — applied in drone's FACING direction on XZ plane
   //    This is the key: pressing forward = direct horizontal acceleration
@@ -1474,8 +1477,8 @@ function updatePhysics(dt) {
     acc.add(dragForce);
   }
 
-  // 6) Vertical damping (prevents floaty feel)
-  d.vel.y *= (1 - 2.0 * dt);
+  // 6) Vertical damping (prevents floaty feel, but not too much)
+  d.vel.y *= (1 - 0.8 * dt);
 
   // Apply acceleration
   d.vel.add(acc.multiplyScalar(dt));
