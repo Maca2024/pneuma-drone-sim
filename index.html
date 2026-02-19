@@ -556,8 +556,8 @@ const CONFIG = {
     gravity: -9.81,
     dragCoeff: 2.5,      // linear drag (not quadratic)
     angularDrag: 3.0,
-    tiltSpeed: 8.0,      // fast tilt response
-    maxTilt: 0.5,        // visual tilt angle
+    tiltSpeed: 10.0,     // instant tilt response
+    maxTilt: 0.75,       // dramatic tilt angle (~43°) — butt goes UP
     yawSpeed: 3.0,       // snappy turning
     liftCoeff: 1.0,
     rotorSpeed: 80,
@@ -1373,13 +1373,12 @@ function processInput(dt) {
   const wantUp = keys['Space'] || (mouse.locked && mouse.lmb);
   const wantDown = keys['ShiftLeft'] || keys['ShiftRight'] || (mouse.locked && mouse.rmb);
 
-  if (wantUp)        d.throttle = Math.min(1, d.throttle + dt * 5.0);  // fast ramp: 0→1 in 0.2s
+  if (wantUp)        d.throttle = Math.min(1, d.throttle + dt * 5.0);  // fast: 0→1 in 0.2s
   else if (wantDown)  d.throttle = Math.max(0, d.throttle - dt * 5.0);
   else {
-    // Auto-hover: smoothly hold altitude
-    const tiltAmount = Math.abs(pitchInput) + Math.abs(rollInput) * 0.5;
-    const hoverThrottle = 0.52 + tiltAmount * 0.15;
-    d.throttle += (hoverThrottle - d.throttle) * dt * 4.0;  // faster convergence
+    // Auto-hover at ~60% — enough to beat gravity (28*0.6/1.5 = 11.2 > 9.81)
+    const hoverThrottle = 0.60;
+    d.throttle += (hoverThrottle - d.throttle) * dt * 4.0;
   }
   // Scroll wheel fine adjustment
   if (mouse.scrollThrottle !== 0) {
@@ -1387,16 +1386,12 @@ function processInput(dt) {
     mouse.scrollThrottle = 0;
   }
 
-  // Smooth tilt (snappy response — reaches target in ~0.15s)
-  const tiltRate = 8.0;
+  // Smooth tilt (snappy — reaches target in ~0.1s)
+  const tiltRate = cfg.tiltSpeed;
   const targetTiltX = pitchInput * cfg.maxTilt;
   const targetTiltZ = rollInput * cfg.maxTilt;
   d.tiltX += (targetTiltX - d.tiltX) * Math.min(1, tiltRate * dt);
   d.tiltZ += (targetTiltZ - d.tiltZ) * Math.min(1, tiltRate * dt);
-
-  // Store raw input for direct force application
-  d._pitchInput = pitchInput;
-  d._rollInput = rollInput;
 
   // === BOOST ===
   if (keys['KeyB'] && d.boost > 0.1 && !d.boosting) {
@@ -1434,50 +1429,70 @@ function updatePhysics(dt) {
 
   const boostMult = d.boosting ? 2.2 : 1.0;
 
-  // === CORE: Arcade flight model ===
-  // 1) Vertical thrust — always points straight up (keeps altitude stable)
-  // Lift: at hover throttle ~0.52 → must exceed gravity (9.81)
-  // 0.52 * 38 / 1.5 = 13.2 → net +3.4 (gentle rise) ✓
-  // full throttle: 1.0 * 38 / 1.5 = 25.3 → net +15.5 (strong climb) ✓
-  const liftForce = d.throttle * cfg.thrustMax / cfg.mass;
-  const verticalAcc = liftForce + cfg.gravity;
+  // === CORE: Tilt-based flight — drone leans to fly ===
+  //
+  // The thrust vector points UP from the drone body.
+  // When the drone tilts forward (nose down, butt up),
+  // the thrust pushes both up AND forward. More tilt = more speed.
+  // Auto-throttle compensates so you don't lose altitude.
 
-  // 2) Forward/backward force — applied in drone's FACING direction on XZ plane
-  //    This is the key: pressing forward = direct horizontal acceleration
-  const facingDir = new THREE.Vector3(
-    -Math.sin(d.yaw),
-    0,
-    -Math.cos(d.yaw)
-  );
-  const strafeDir = new THREE.Vector3(
-    -Math.cos(d.yaw),
-    0,
-    Math.sin(d.yaw)
-  );
-  const forwardForce = 45 * boostMult; // strong direct force
-  const strafeForce = 35 * boostMult;
+  // Total thrust magnitude (stronger than gravity so we can hover + move)
+  const thrustPower = 28 * boostMult;
 
-  const moveAcc = new THREE.Vector3();
-  moveAcc.add(facingDir.clone().multiplyScalar(d._pitchInput * forwardForce / cfg.mass));
-  moveAcc.add(strafeDir.clone().multiplyScalar(d._rollInput * strafeForce / cfg.mass));
+  // Build thrust direction from drone orientation
+  // tiltX > 0 = nose down = thrust pushes forward (-Z in drone local)
+  // tiltZ > 0 = lean left = thrust pushes right
+  const thrustVec = new THREE.Vector3(0, 1, 0);
+  // Apply yaw rotation
+  const sinY = Math.sin(d.yaw), cosY = Math.cos(d.yaw);
 
-  // 3) Gravity + lift
-  const acc = new THREE.Vector3(0, verticalAcc, 0);
-  acc.add(moveAcc);
+  // Decompose tilt into world-space thrust:
+  // Forward component from pitch (tiltX)
+  const fwdAmount = Math.sin(d.tiltX); // how much thrust goes forward
+  const upFromPitch = Math.cos(d.tiltX); // remaining goes up
 
-  // 4) Wind (gentle)
-  acc.add(state.wind.clone().multiplyScalar(0.2 / cfg.mass));
+  // Strafe component from roll (tiltZ)
+  const strafeAmount = Math.sin(d.tiltZ);
+  const upFromRoll = Math.cos(d.tiltZ);
 
-  // 5) Drag — linear for game feel (not quadratic which kills speed)
+  // Combined upward factor
+  const upFactor = upFromPitch * upFromRoll;
+
+  // World-space thrust direction
+  const thrustDir = new THREE.Vector3(
+    -fwdAmount * sinY + strafeAmount * cosY, // X: forward projected + strafe projected
+    upFactor,                                  // Y: remaining upward thrust
+    -fwdAmount * cosY - strafeAmount * sinY   // Z: forward projected + strafe projected
+  ).normalize();
+
+  // Apply thrust
+  const acc = thrustDir.multiplyScalar(thrustPower * d.throttle / cfg.mass);
+
+  // Gravity
+  acc.y += cfg.gravity;
+
+  // Auto-throttle compensation: when tilting, increase throttle to keep altitude
+  // This is the key trick: you tilt to steer but don't lose height
+  const tiltAmount = Math.abs(d.tiltX) + Math.abs(d.tiltZ) * 0.7;
+  const altCompensation = tiltAmount * 8.0; // extra upward push when tilted
+  acc.y += altCompensation * d.throttle;
+
+  // Wind (gentle)
+  acc.add(state.wind.clone().multiplyScalar(0.15 / cfg.mass));
+
+  // Drag — horizontal and vertical separately for better feel
   const speed = d.vel.length();
-  const dragCoeff = d.boosting ? 1.2 : 2.5;
-  if (speed > 0.1) {
-    const dragForce = d.vel.clone().normalize().multiplyScalar(-dragCoeff * speed / cfg.mass);
-    acc.add(dragForce);
+  const hSpeed = Math.sqrt(d.vel.x * d.vel.x + d.vel.z * d.vel.z);
+
+  // Horizontal drag (linear — allows high speed)
+  const hDrag = d.boosting ? 1.0 : 2.0;
+  if (hSpeed > 0.1) {
+    acc.x -= d.vel.x * hDrag / cfg.mass;
+    acc.z -= d.vel.z * hDrag / cfg.mass;
   }
 
-  // 6) Vertical damping (prevents floaty feel, but not too much)
-  d.vel.y *= (1 - 0.8 * dt);
+  // Vertical drag (stronger — prevents floating away)
+  acc.y -= d.vel.y * 3.0 / cfg.mass;
 
   // Apply acceleration
   d.vel.add(acc.multiplyScalar(dt));
@@ -1991,12 +2006,10 @@ function resetDrone() {
   droneState.pos.set(0, 2, 0);
   droneState.vel.set(0, 0, 0);
   droneState.rotation.set(0, 0, 0);
-  droneState.throttle = 0.52;  // start at hover throttle (not 0!)
+  droneState.throttle = 0.60;  // start at hover throttle
   droneState.tiltX = 0;
   droneState.tiltZ = 0;
   droneState.yaw = 0;
-  droneState._pitchInput = 0;
-  droneState._rollInput = 0;
   droneState.boost = 1;
   droneState.boosting = false;
   state.battery = 100;
