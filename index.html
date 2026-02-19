@@ -552,13 +552,13 @@ const CONFIG = {
   world: { size: 2000, gridSize: 200, maxAlt: 500 },
   drone: {
     mass: 1.5,
-    thrustMax: 35,
+    thrustMax: 22,       // lift only (arcade: vertical)
     gravity: -9.81,
-    dragCoeff: 0.47,
+    dragCoeff: 2.5,      // linear drag (not quadratic)
     angularDrag: 3.0,
-    tiltSpeed: 3.5,
-    maxTilt: 0.6,
-    yawSpeed: 2.5,
+    tiltSpeed: 8.0,      // fast tilt response
+    maxTilt: 0.5,        // visual tilt angle
+    yawSpeed: 3.0,       // snappy turning
     liftCoeff: 1.0,
     rotorSpeed: 80,
   },
@@ -1337,7 +1337,7 @@ function updateAudio() {
 }
 
 // ============================================================
-// PHYSICS — Unified keyboard + mouse input
+// PHYSICS — Arcade-style: responsive, fun, actually flies forward!
 // ============================================================
 function processInput(dt) {
   const d = droneState;
@@ -1350,17 +1350,37 @@ function processInput(dt) {
   mouse.dx = 0;
   mouse.dy = 0;
 
+  // === PITCH (forward/backward) ===
+  let pitchInput = 0;
+  if (keys['ArrowUp'] || keys['KeyW'])    pitchInput += 1;
+  if (keys['ArrowDown'] || keys['KeyS'])  pitchInput -= 1;
+  if (mouse.locked) pitchInput -= mouse.smoothY * 25;
+  pitchInput = Math.max(-1, Math.min(1, pitchInput));
+
+  // === YAW (turning left/right) ===
+  let yawInput = 0;
+  if (keys['ArrowLeft'] || keys['KeyQ'])  yawInput -= 1;
+  if (keys['ArrowRight'] || keys['KeyE']) yawInput += 1;
+  if (mouse.locked) yawInput += mouse.smoothX * 30;
+  d.yaw += yawInput * cfg.yawSpeed * dt;
+
+  // === ROLL (strafe / bank) ===
+  let rollInput = 0;
+  if (keys['KeyA']) rollInput += 1;
+  if (keys['KeyD']) rollInput -= 1;
+
   // === THROTTLE (vertical) ===
-  // Space / LMB = up, Shift / RMB = down, Scroll = fine tune
   const wantUp = keys['Space'] || (mouse.locked && mouse.lmb);
   const wantDown = keys['ShiftLeft'] || keys['ShiftRight'] || (mouse.locked && mouse.rmb);
 
-  if (wantUp)       d.throttle = Math.min(1, d.throttle + dt * 2.2);
-  else if (wantDown) d.throttle = Math.max(0, d.throttle - dt * 2.8);
+  if (wantUp)        d.throttle = Math.min(1, d.throttle + dt * 2.5);
+  else if (wantDown)  d.throttle = Math.max(0, d.throttle - dt * 3.0);
   else {
-    // Gentle auto-hover
-    const hoverThrottle = 0.48;
-    d.throttle += (hoverThrottle - d.throttle) * dt * 0.8;
+    // Auto-hover: smoothly go to hover throttle
+    // Compensate more when tilting so drone doesn't drop
+    const tiltAmount = Math.abs(pitchInput) + Math.abs(rollInput) * 0.5;
+    const hoverThrottle = 0.52 + tiltAmount * 0.15;
+    d.throttle += (hoverThrottle - d.throttle) * dt * 2.0;
   }
   // Scroll wheel fine adjustment
   if (mouse.scrollThrottle !== 0) {
@@ -1368,33 +1388,16 @@ function processInput(dt) {
     mouse.scrollThrottle = 0;
   }
 
-  // === YAW (turning left/right) ===
-  // Arrow Left/Right + Q/E + mouse X (when locked)
-  let yawInput = 0;
-  if (keys['ArrowLeft'] || keys['KeyQ'])  yawInput -= 1;
-  if (keys['ArrowRight'] || keys['KeyE']) yawInput += 1;
-  if (mouse.locked) yawInput += mouse.smoothX * 40; // mouse yaw
-  d.yaw += yawInput * cfg.yawSpeed * dt;
-
-  // === PITCH (forward/backward) ===
-  // Arrow Up/Down + W/S + mouse Y (when locked)
-  let pitchInput = 0;
-  if (keys['ArrowUp'] || keys['KeyW'])    pitchInput += 1;
-  if (keys['ArrowDown'] || keys['KeyS'])  pitchInput -= 1;
-  if (mouse.locked) pitchInput -= mouse.smoothY * 30; // mouse pitch (inverted: push mouse forward = fly forward)
-  const targetTiltX = Math.max(-cfg.maxTilt, Math.min(cfg.maxTilt, pitchInput * cfg.maxTilt));
-
-  // === ROLL (strafe / bank) ===
-  // A/D for keyboard roll
-  let rollInput = 0;
-  if (keys['KeyA']) rollInput += 1;
-  if (keys['KeyD']) rollInput -= 1;
+  // Smooth tilt (snappy response — reaches target in ~0.15s)
+  const tiltRate = 8.0;
+  const targetTiltX = pitchInput * cfg.maxTilt;
   const targetTiltZ = rollInput * cfg.maxTilt;
+  d.tiltX += (targetTiltX - d.tiltX) * Math.min(1, tiltRate * dt);
+  d.tiltZ += (targetTiltZ - d.tiltZ) * Math.min(1, tiltRate * dt);
 
-  // Smooth tilt transitions (snappy but not instant)
-  const tiltLerp = 1 - Math.pow(0.001, dt); // ~frame-rate independent smoothing
-  d.tiltX += (targetTiltX - d.tiltX) * Math.min(1, cfg.tiltSpeed * dt * 2.5);
-  d.tiltZ += (targetTiltZ - d.tiltZ) * Math.min(1, cfg.tiltSpeed * dt * 2.5);
+  // Store raw input for direct force application
+  d._pitchInput = pitchInput;
+  d._rollInput = rollInput;
 
   // === BOOST ===
   if (keys['KeyB'] && d.boost > 0.1 && !d.boosting) {
@@ -1407,7 +1410,6 @@ function processInput(dt) {
       d.boost = Math.max(0, d.boost);
     }
   } else {
-    // Recharge boost slowly
     d.boost = Math.min(1, d.boost + dt * 0.15);
   }
 
@@ -1429,38 +1431,53 @@ function updatePhysics(dt) {
   const d = droneState;
   const cfg = CONFIG.drone;
 
-  // Process all inputs first
   processInput(dt);
 
-  // Thrust vector (based on drone orientation)
-  const boostMultiplier = d.boosting ? 2.0 : 1.0;
-  const thrustMag = d.throttle * cfg.thrustMax * boostMultiplier;
-  const quat = new THREE.Quaternion().setFromEuler(
-    new THREE.Euler(d.tiltX, d.yaw, d.tiltZ, 'YXZ')
+  const boostMult = d.boosting ? 2.2 : 1.0;
+
+  // === CORE: Arcade flight model ===
+  // 1) Vertical thrust — always points straight up (keeps altitude stable)
+  const liftForce = d.throttle * cfg.thrustMax * 1.1 / cfg.mass;
+  const verticalAcc = liftForce + cfg.gravity; // net vertical
+
+  // 2) Forward/backward force — applied in drone's FACING direction on XZ plane
+  //    This is the key: pressing forward = direct horizontal acceleration
+  const facingDir = new THREE.Vector3(
+    -Math.sin(d.yaw),
+    0,
+    -Math.cos(d.yaw)
   );
-  const thrustDir = new THREE.Vector3(0, 1, 0).applyQuaternion(quat);
-  const thrust = thrustDir.multiplyScalar(thrustMag / cfg.mass);
+  const strafeDir = new THREE.Vector3(
+    -Math.cos(d.yaw),
+    0,
+    Math.sin(d.yaw)
+  );
+  const forwardForce = 45 * boostMult; // strong direct force
+  const strafeForce = 35 * boostMult;
 
-  // Gravity
-  const gravity = new THREE.Vector3(0, cfg.gravity, 0);
+  const moveAcc = new THREE.Vector3();
+  moveAcc.add(facingDir.clone().multiplyScalar(d._pitchInput * forwardForce / cfg.mass));
+  moveAcc.add(strafeDir.clone().multiplyScalar(d._rollInput * strafeForce / cfg.mass));
 
-  // Drag (reduced when boosting for speed feel)
+  // 3) Gravity + lift
+  const acc = new THREE.Vector3(0, verticalAcc, 0);
+  acc.add(moveAcc);
+
+  // 4) Wind (gentle)
+  acc.add(state.wind.clone().multiplyScalar(0.2 / cfg.mass));
+
+  // 5) Drag — linear for game feel (not quadratic which kills speed)
   const speed = d.vel.length();
-  const effectiveDrag = d.boosting ? cfg.dragCoeff * 0.3 : cfg.dragCoeff;
-  const drag = d.vel.clone().normalize().multiplyScalar(-effectiveDrag * speed * speed / cfg.mass);
+  const dragCoeff = d.boosting ? 1.2 : 2.5;
+  if (speed > 0.1) {
+    const dragForce = d.vel.clone().normalize().multiplyScalar(-dragCoeff * speed / cfg.mass);
+    acc.add(dragForce);
+  }
 
-  // Wind
-  const windForce = state.wind.clone().multiplyScalar(0.3 / cfg.mass);
+  // 6) Vertical damping (prevents floaty feel)
+  d.vel.y *= (1 - 2.0 * dt);
 
-  // Forward/backward movement from tilt (stronger = more responsive)
-  const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(quat);
-  const right = new THREE.Vector3(1, 0, 0).applyQuaternion(quat);
-  const moveMult = boostMultiplier * 30;
-  const moveForce = forward.multiplyScalar(d.tiltX * moveMult / cfg.mass)
-    .add(right.multiplyScalar(-d.tiltZ * moveMult / cfg.mass));
-
-  // Sum forces
-  const acc = thrust.add(gravity).add(drag).add(windForce).add(moveForce);
+  // Apply acceleration
   d.vel.add(acc.multiplyScalar(dt));
 
   // Position update
